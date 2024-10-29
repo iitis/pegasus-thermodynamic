@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import json
+
 from dimod import BinaryQuadraticModel
 from collections import OrderedDict
 
@@ -83,4 +85,22 @@ def vectorize(h: dict, J: dict):
 
 def energy(s: np.ndarray, h: np.ndarray, J: np.ndarray):
     return np.dot(np.dot(s, J), s) + np.dot(s, h)
+
+
+def read_instance(path: str):
+    with open(path, "r") as f:
+        file = json.load(f)
+    J = {}
+    h = {}
+    model_temp = file["model"]
+    solution = file["solution"]
+
+    for k, v in model_temp.items():
+        (k1, k2) = eval(k)
+        if k1 == k2:
+            h[k1] = v
+        else:
+            J[(k1, k2)] = v
+    return h, J, solution
+
 
