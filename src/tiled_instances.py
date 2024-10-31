@@ -14,7 +14,7 @@ from dwave.system import DWaveSampler
 from dwave.embedding import is_valid_embedding
 from matplotlib import pyplot as plt
 from tqdm import tqdm
-from src.instance_generation import find_embedding
+from src.utils import find_embedding
 
 rng = np.random.default_rng()
 

@@ -1,6 +1,9 @@
+import json
+import minorminer
+
+import networkx as nx
 import numpy as np
 import pandas as pd
-import json
 
 from dimod import BinaryQuadraticModel
 from collections import OrderedDict
@@ -103,4 +106,15 @@ def read_instance(path: str):
             J[(k1, k2)] = v
     return h, J, solution
 
+
+def find_embedding(source: nx.Graph, target: nx.Graph):
+    embedding = minorminer.find_embedding(source, target, chainlength_patience=10)
+    contains_chains = any(len(chain) > 1 for chain in embedding.values())
+    while contains_chains:
+        embedding = minorminer.find_embedding(source, target, chainlength_patience=100)
+        contains_chains = any(len(chain) > 1 for chain in embedding.values())
+
+    for value in embedding.values():
+        assert len(value) == 1
+    return embedding
 
