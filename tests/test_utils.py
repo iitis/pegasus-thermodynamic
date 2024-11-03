@@ -1,9 +1,11 @@
 import unittest
+import os
 import numpy as np
-from src.utils import vectorize, energy
+from src.utils import vectorize, energy, read_3_body_instance
 from dimod import BinaryQuadraticModel
 
 rng = np.random.default_rng()
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class EnergyEquivalence(unittest.TestCase):
@@ -36,6 +38,16 @@ class EnergyEquivalence(unittest.TestCase):
         bqm = BinaryQuadraticModel("SPIN")
         bqm = bqm.from_ising(self.h, self.J)
         self.assertAlmostEqual(bqm.energy(state), energy_naive)
+
+
+class OtherFunctions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.path_to_3_body_instance = os.path.join(ROOT, "files", "random3BodyIsing_dense_L=10_1.json")
+
+    def test_read_instance(self):
+        h, J, solution = read_3_body_instance(self.path_to_3_body_instance)
+
 
 
 if __name__ == '__main__':

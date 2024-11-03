@@ -90,7 +90,7 @@ def energy(s: np.ndarray, h: np.ndarray, J: np.ndarray):
     return np.dot(np.dot(s, J), s) + np.dot(s, h)
 
 
-def read_instance(path: str):
+def read_3_body_instance(path: str):
     with open(path, "r") as f:
         file = json.load(f)
     J = {}

@@ -2,8 +2,6 @@ import copy
 import os
 import json
 import glob
-from typing import Optional
-
 import minorminer
 
 import numpy as np
@@ -14,26 +12,15 @@ from dwave.system import DWaveSampler
 from dwave.embedding import is_valid_embedding
 from matplotlib import pyplot as plt
 from tqdm import tqdm
+from typing import Optional
+from math import ceil
+
 from src.utils import find_embedding
 
 rng = np.random.default_rng()
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INSTANCE_DIR_BASE = os.path.join(ROOT, "data", "Advantage_system6.4")
-
-
-def build_king_ladder(size: int):
-    n = int(size / 2)
-    kings_graph = nx.ladder_graph(n)
-    for node in range(n):
-        if node == 0:
-            kings_graph.add_edge(node, node + n + 1)
-        elif node == n - 1:
-            kings_graph.add_edge(node, node + n - 1)
-        else:
-            kings_graph.add_edge(node, node + n + 1)
-            kings_graph.add_edge(node, node + n - 1)
-    return kings_graph
+INSTANCE_DIR_BASE = os.path.join(ROOT, "data", "Advantage_system5.4")
 
 
 def find_disjoint_k_cliques(clique_size: int, graph: nx.Graph):
@@ -51,6 +38,22 @@ def find_disjoint_k_cliques(clique_size: int, graph: nx.Graph):
             used_nodes.update(clique)
     return disjoint_cliques
 
+
+def find_minimal_num_unit_cells(graph: nx.Graph):
+    n = graph.number_of_nodes()
+    return int(ceil(n/24))
+
+
+def tile_instance(graph: nx.Graph, qpu_graph: nx.Graph):
+    embedded_instances = []
+    unit_cells = []
+    pegasus_nice_numbering = {node: dnx.pegasus_coordinates(16).linear_to_nice(node) for node in graph.nodes}
+    lattice_size = 15
+    xs = range(lattice_size)
+    ys = range(lattice_size)
+    min_unit_cells = find_minimal_num_unit_cells(graph)
+    for x_bound in tqdm(xs, desc="finding partition of QPU graph"):
+        ...
 
 def remap_king_ladders_pegasus(graph: nx.Graph, instances: list[dict]):
     embedded_instances = []
@@ -80,7 +83,7 @@ def remap_king_ladders_pegasus(graph: nx.Graph, instances: list[dict]):
     return embedded_instances
 
 
-def get_spin_system(instance):
+def get_spin_system_bqpjson(instance):
     system = []
     for linear_term in instance['linear_terms']:
         system.append({"i": linear_term['id'], "v": linear_term['coeff']})
@@ -91,7 +94,7 @@ def get_spin_system(instance):
 
 
 def write_instances_to_file(instances, outfile):
-    spin_systems = [get_spin_system(instance) for instance in instances]
+    spin_systems = [get_spin_system_bqpjson(instance) for instance in instances]
     linear_terms = []
     quadratic_terms = []
     variable_ids = []
@@ -102,7 +105,7 @@ def write_instances_to_file(instances, outfile):
         variable_ids = variable_ids + instance['variable_ids']
 
     variable_ids.sort()
-    bqp_instance = bqpjson = {
+    bqp_instance = {
         "id": len(instances),
         "version": "1.0.0",
         "description": "Tiled Hamiltonians to be run on D-Wave",
