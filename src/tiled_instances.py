@@ -44,14 +44,14 @@ def find_minimal_num_unit_cells(graph: nx.Graph):
     return int(ceil(n/24))
 
 
-def tile_instance(graph: nx.Graph, qpu_graph: nx.Graph):
+def tile_instance(instance_graph: nx.Graph, qpu_graph: nx.Graph):
     embedded_instances = []
     unit_cells = []
-    pegasus_nice_numbering = {node: dnx.pegasus_coordinates(16).linear_to_nice(node) for node in graph.nodes}
+    pegasus_nice_numbering = {node: dnx.pegasus_coordinates(16).linear_to_nice(node) for node in instance_graph.nodes}
     lattice_size = 15
     xs = range(lattice_size)
     ys = range(lattice_size)
-    min_unit_cells = find_minimal_num_unit_cells(graph)
+    min_unit_cells = find_minimal_num_unit_cells(instance_graph)
     for x_bound in tqdm(xs, desc="finding partition of QPU graph"):
         ...
 
