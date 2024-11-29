@@ -4,6 +4,7 @@ import minorminer
 import networkx as nx
 import numpy as np
 import pandas as pd
+import h5py
 
 from dimod import BinaryQuadraticModel
 from collections import OrderedDict
@@ -118,3 +119,27 @@ def find_embedding(source: nx.Graph, target: nx.Graph):
         assert len(value) == 1
     return embedding
 
+
+def h5_tree(val, pre=''):
+    items = len(val)
+    for key, val in val.items():
+        items -= 1
+        if items == 0:
+            # the last item
+            if type(val) == h5py._hl.group.Group:
+                print(pre + '└── ' + key)
+                h5_tree(val, pre+'    ')
+            else:
+                try:
+                    print(pre + '└── ' + key + ' (%d)' % len(val))
+                except TypeError:
+                    print(pre + '└── ' + key + ' (scalar)')
+        else:
+            if type(val) == h5py._hl.group.Group:
+                print(pre + '├── ' + key)
+                h5_tree(val, pre+'│   ')
+            else:
+                try:
+                    print(pre + '├── ' + key + ' (%d)' % len(val))
+                except TypeError:
+                    print(pre + '├── ' + key + ' (scalar)')
