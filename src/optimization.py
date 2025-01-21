@@ -5,40 +5,62 @@ import numpy as np
 import pandas as pd
 
 from scipy import optimize
-from src.utils import pseudo_likelihood, extend, vectorize, energy
+from utils import pseudo_likelihood, extend, vectorize, energy
+from collections import namedtuple
+from dimod import BinaryQuadraticModel
+
+Instance = namedtuple("Instance", ["h", "J", "name"])
+
+PHYSICAL_UNITS = False
+
+B0 = 1.0  # actually B0 = 8.58.. but this is included into annealing schedule
+h = 6.62607015e-34  # Planck constant, in J/Hz
+kb = 1.380649e-23  # Boltzmann constant, in J/K
+energy_units = (B0 / 2) * 10**9 * h
+beta_units = kb / energy_units
+if PHYSICAL_UNITS == False:
+    energy_units = 1
+    beta_units = 1
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CWD = os.getcwd()
-DATA = os.path.join(ROOT, "data", "raw_data", "scalability")
-RESULTS = os.path.join(ROOT, "data", "results", "scalability")
+# hrange = [0.1, 0.5, 1.0, 2.0]
+# hname = ["vsmall", "small", "med", "large"]
+inst_type = "vsmall_h"
+# DATA = os.path.join(ROOT, "data", "raw_data", f"annealing_param_{inst_type}")
+# RESULTS = os.path.join(ROOT, "data", "results", f"annealing_param_{inst_type}")
+DATA = os.path.join(ROOT, "data", "raw_data", f"merged_scalability_1d_{inst_type}")
+RESULTS = os.path.join(ROOT, "data", "results", f"merged_scalability_1d_{inst_type}")
+print(DATA)
+
+if not os.path.exists(RESULTS):
+    os.makedirs(RESULTS)
 
 betas = {}
 energies = {}
 Q = {}
-
-# with open(os.path.join(ROOT, "data", "instance.pkl"), "rb") as f:
-#     h, J = pickle.load(f)
-#     h_vect, J_vect = vectorize(h, J)
-#     J = extend(J)
-#     chain_length = len(h)
+Q_dist = {}
 
 
 def main():
     for filename in os.listdir(DATA):
         file_path = os.path.join(DATA, filename)
         if os.path.isfile(file_path):
-            print(f"optimizing {filename}")
+            print(f"optimizing {filename}, {inst_type}")
             name = filename[0:-4]
             parameters = name.split("_")
             chain_length = parameters[3]
-            pause_time = parameters[4]
-            if int(chain_length) != 500:
-                continue
-
-            with open(os.path.join(ROOT, "data", f"instance_{chain_length}.pkl"), "rb") as f:
+            anneal_time = parameters[4]
+            anneal_param = parameters[5]
+            # if int(chain_length) != 500:
+            #     continue
+            with open(
+                os.path.join(ROOT, "data", "instances", f"instance_{chain_length}_{inst_type}.pkl"),
+                "rb",
+            ) as f:
                 h, J = pickle.load(f)
                 h_vect, J_vect = vectorize(h, J)
-                J = extend(J)
+                J_ext = extend(J)
 
             df = pd.read_csv(file_path, index_col=0)
 
@@ -46,32 +68,51 @@ def main():
             E_final = []
             Q_vect = []
             for row in df.itertuples():
+                if row.energy == "energy":
+                    continue
                 state = eval(row.sample)
                 state = list(state.values())
                 configurations.append(state)
-                energy_final = row.energy
+                energy_final = float(row.energy)
                 E_final.append(energy_final / int(chain_length))  # per spin
                 init_state = eval(row.init_state)
                 init_state = np.array(list(init_state.values()))
                 energy_init = energy(init_state, h_vect, J_vect)
-                Q_vect.append((energy_final - energy_init) / int(chain_length))  # per spin
+                Q_vect.append(
+                    (energy_final - energy_init) / int(chain_length)
+                )  # per spin
 
-            optim = optimize.minimize(pseudo_likelihood, np.array([1.0]), args=(h, J, np.array(configurations)))
-            with open(os.path.join(RESULTS, "betas2_500.pkl"), "wb") as f:
-                betas[(chain_length, pause_time)] = optim.x.item()
+            optim = optimize.minimize(
+                pseudo_likelihood,
+                np.array([1.0]),
+                args=(h, J_ext, np.array(configurations)),
+            )
+            with open(os.path.join(RESULTS, f"betas2_{chain_length}.pkl"), "wb") as f:
+                betas[(anneal_time, anneal_param)] = optim.x.item() * beta_units
                 pickle.dump(betas, f)
             print("result: beta = ", optim.x.item())
-            with open(os.path.join(RESULTS, "energies_500.pkl"), "wb") as f2:
+            with open(
+                os.path.join(RESULTS, f"energies_{chain_length}.pkl"), "wb"
+            ) as f2:
                 E_mean, E_var = np.mean(np.array(E_final)), np.var(np.array(E_final))
-                energies[(chain_length, pause_time)] = (E_mean, E_var)
+                energies[(anneal_time, anneal_param)] = (
+                    E_mean * energy_units,
+                    E_var * energy_units**2,
+                )
                 pickle.dump(energies, f2)
             print("result: energies = ", (E_mean, E_var))
-            with open(os.path.join(RESULTS, "Q_500.pkl"), "wb") as f3:
+            with open(os.path.join(RESULTS, f"Q_{chain_length}.pkl"), "wb") as f3:
                 Q_mean, Q_var = np.mean(np.array(Q_vect)), np.var(np.array(Q_vect))
-                Q[(chain_length, pause_time)] = (Q_mean, Q_var)
+                Q[(anneal_time, anneal_param)] = (
+                    Q_mean * energy_units,
+                    Q_var * energy_units**2,
+                )
                 pickle.dump(Q, f3)
             print("result: Q = ", (Q_mean, Q_var))
+            with open(os.path.join(RESULTS, f"Q_dist_{chain_length}.pkl"), "wb") as f4:
+                Q_dist[(anneal_time, anneal_param)] = np.array(Q_vect)
+                pickle.dump(Q_dist, f4)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
