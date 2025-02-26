@@ -47,12 +47,13 @@ def pseudo_likelihood(beta_eff: float, h: dict, J: dict, samples: np.ndarray):
     N = samples.shape[1]
     D = samples.shape[0]
     L = 0.0
-
+    J = extend(J)
     for d in range(D):
         for i in range(N):
             L += np.log(1 + np.exp(-2 * beta_eff * samples[d, i] *
                                    (h[i] + sum([J[(i, j)] * samples[d, j] for j in neighbour(i, N)]))))
     return L/(N * D)
+
 
 def pseudo_likelihood_2d(beta_eff: float, h: dict, J: dict, samples: np.ndarray):
     N = samples.shape[1]
@@ -60,10 +61,24 @@ def pseudo_likelihood_2d(beta_eff: float, h: dict, J: dict, samples: np.ndarray)
     L = 0.0
 
     for d in range(D):
-        for (i,j) in J.keys():
+        for (i, j) in J.keys():
             L += np.log(1 + np.exp(-2 * beta_eff * samples[d, i] *
                                    (h[i] + sum([J[(i, j)] * samples[d, j] ]))))
     return L/(N * D)
+
+
+def pseudo_likelihood_2d_vectorised(beta_eff: float, h: np.ndarray, J: np.ndarray, samples: np.ndarray):
+    N = samples.shape[1]
+    D = samples.shape[0]
+
+    S = samples.T  # we need states to be in columns vector
+    h = h.reshape((len(h), 1))  # column vector
+
+    A = -2 * beta_eff * S * (J @ S + h)
+    B = np.log(1 + np.exp(A))
+    L = np.sum(B)
+    return L / (N * D)
+
 
 def gibbs_sampling_ising(h: dict, J: dict, beta: float, num_steps: int):
     s = OrderedDict({i: rng.choice([-1, 1]) for i in h.keys()})
@@ -95,6 +110,7 @@ def vectorize(h: dict, J: dict):
     for key, value in J.items():
         J_vect[key[0]][key[1]] = value
     return h_vect, J_vect
+
 
 def vectorize_2d(h: dict, J: dict):
     key_map = {key: i for i, key in enumerate(h.keys())} 

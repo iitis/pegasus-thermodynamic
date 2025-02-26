@@ -32,7 +32,7 @@ DATA = os.path.join(ROOT, "data", "raw_data", f"annealing_param_2d_{itype}")
 RESULTS = os.path.join(ROOT, "data", "results", f"annealing_param_2d_{itype}")
 
 if not os.path.exists(RESULTS):
-  os.makedirs(RESULTS)
+    os.makedirs(RESULTS)
 
 betas = {}
 energies = {}
@@ -44,6 +44,7 @@ Q_dist = {}
 #     h_vect, J_vect = vectorize(h, J)
 #     J = extend(J)
 #     chain_length = len(h)
+
 
 def main():
     sort_key = lambda x: int(x.split("_")[3])
