@@ -8,6 +8,7 @@ import h5py
 
 from dimod import BinaryQuadraticModel
 from collections import OrderedDict
+from tqdm import tqdm
 
 rng = np.random.default_rng()
 
@@ -34,6 +35,7 @@ def neighbour(i: int, N: int) -> list:
         return [N - 2]
     else:
         return [i-1, i+1]
+
 
 def extend(J: dict) -> dict:
     J_new = {}
@@ -100,6 +102,22 @@ def gibbs_sampling_ising(h: dict, J: dict, beta: float, num_steps: int):
         s[pos] = rng.choice([-1, 1], p=[1-prob, prob])
 
     return s
+
+
+def gibbs_sampling_ising_vectorized_2d(h: dict, J: dict, beta: float, num_steps: int):
+    h_vect, J_vect, _, _, _ = vectorize_2d(h, J)
+    n = len(h)
+    spins = rng.choice([-1, 1], size=n)
+
+    for _ in tqdm(range(num_steps), desc="gibbs sampling"):
+        idx = rng.integers(0, n)
+        s_plus, s_minus = spins, spins
+        s_plus[idx] = 1
+        s_minus[idx] = -1
+        deltaE = energy(s_plus, h_vect, J_vect) - energy(s_minus, h_vect, J_vect)
+        prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
+        spins[idx] = rng.choice([-1, 1], p=[1 - prob, prob])
+    return spins
 
 
 def vectorize(h: dict, J: dict):
