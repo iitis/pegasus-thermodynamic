@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from scipy import optimize
-from utils import pseudo_likelihood_2d, extend, vectorize, energy, vectorize_2d
+from utils import pseudo_likelihood_2d_vectorised, extend, vectorize, energy, vectorize_2d
 from collections import namedtuple
 from dimod import BinaryQuadraticModel
 Instance = namedtuple("Instance", ["h", "J", "name"])
@@ -26,28 +26,23 @@ CWD = os.getcwd()
 # DATA = os.path.join(ROOT, "data", "raw_data", "scalability_2d_cbfm")
 # RESULTS = os.path.join(ROOT, "data", "results", "scalability_2d_cbfm")
 
-itype = "const"  
-
-DATA = os.path.join(ROOT, "data", "raw_data", f"annealing_param_2d_{itype}")
-RESULTS = os.path.join(ROOT, "data", "results", f"annealing_param_2d_{itype}")
-
-if not os.path.exists(RESULTS):
-    os.makedirs(RESULTS)
-
-betas = {}
-energies = {}
-Q = {}
-Q_dist = {}
-
-# with open(os.path.join(ROOT, "data", "instance.pkl"), "rb") as f:
-#     h, J = pickle.load(f)
-#     h_vect, J_vect = vectorize(h, J)
-#     J = extend(J)
-#     chain_length = len(h)
-
+itypes = ["const"]
 
 def main():
-    sort_key = lambda x: int(x.split("_")[3])
+  for itype in itypes:
+    print(f"Running for {itype}")
+    DATA = os.path.join(ROOT, "data", "raw_data", f"new3_gibbs_annealing_param_2d_{itype}")
+    RESULTS = os.path.join(ROOT, "data", "results", f"new3_gibbs_annealing_param_2d_{itype}")
+    
+    if not os.path.exists(RESULTS):
+        os.makedirs(RESULTS)
+    
+    betas = {}
+    energies = {}
+    Q = {}
+    Q_dist = {}
+
+    sort_key = lambda x: (int(x.split("_")[3]), int(x.split("_")[4]), float(x[0:-4].split("_")[5]))
     filenames = sorted(os.listdir(DATA), key=sort_key)
     for filename in filenames:
         
@@ -59,16 +54,13 @@ def main():
             chain_length = parameters[3]
             anneal_time = parameters[4]
             anneal_param = parameters[5]
-            # if int(chain_length) != 500:
-            #     continue
-            # with open(os.path.join(ROOT, "data", f"instance_{chain_length}_large_h.pkl"), "rb") as f:
             with open(os.path.join(ROOT, "data", "instances", f"p{chain_length}_{itype}.pkl"), "rb") as f:
-                # h, J = pickle.load(f)
                 inst = pickle.load(f)
                 h = inst.h
                 J = inst.J
+                # J_ext = extend(J)
                 h_vect, J_vect, h, J, key_map = vectorize_2d(h, J)
-                J_ext = extend(J)
+                # h_vect, J_vect = vectorize(h, J)
 
             df = pd.read_csv(file_path, index_col=0)
 
@@ -89,7 +81,7 @@ def main():
                 energy_init = energy(init_state, h_vect, J_vect)
                 Q_vect.append((energy_final - energy_init) / int(chain_length))  # per spin
 
-            optim = optimize.minimize(pseudo_likelihood_2d, np.array([1.0]), args=(h, J_ext, np.array(configurations)))
+            optim = optimize.minimize(pseudo_likelihood_2d_vectorised, np.array([1.0]), args=(h_vect, J_vect, np.array(configurations)))
             with open(os.path.join(RESULTS, f"betas2_P{chain_length}.pkl"), "wb") as f:
                 betas[(anneal_time, anneal_param)] = optim.x.item() * beta_units
                 pickle.dump(betas, f)
