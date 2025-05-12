@@ -1,4 +1,6 @@
 import json
+from copy import copy
+
 import minorminer
 
 import networkx as nx
@@ -111,13 +113,28 @@ def gibbs_sampling_ising_vectorized_2d(h: dict, J: dict, beta: float, num_steps:
 
     for _ in tqdm(range(num_steps), desc="gibbs sampling"):
         idx = rng.integers(0, n)
-        s_plus, s_minus = spins, spins
-        s_plus[idx] = 1
+        s_plus = copy(spins)
+        s_minus = copy(spins)
+        s_plus[idx] = +1
         s_minus[idx] = -1
         deltaE = energy(s_plus, h_vect, J_vect) - energy(s_minus, h_vect, J_vect)
         prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
         spins[idx] = rng.choice([-1, 1], p=[1 - prob, prob])
     return spins
+
+
+def find_neighbours(h: dict, J: dict):
+    neighbourhood = {}
+    for node in h.keys():
+        for edge in J.keys():
+            if node in edge:
+                ...
+
+def gibbs_sampling_efficient(h: dict, J: dict, beta: float, num_steps: int):
+
+    spins =  OrderedDict({i: rng.choice([-1, 1]) for i in h.keys()})
+    for _ in range(num_steps):
+        idx = rng.choice(list(h.keys()))
 
 
 def vectorize(h: dict, J: dict):
