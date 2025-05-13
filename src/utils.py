@@ -144,7 +144,7 @@ def gibbs_sampling_efficient(h: dict, J: dict, beta: float, num_steps: int):
             J_ij = J[(idx, j)] if (idx, j) in J.keys() else J[(j, idx)]
             sum += J_ij * spins[j]
         # Difference s+ and s-
-        deltaE = 2 * sum * h[idx]
+        deltaE = 2 * (sum + h[idx])
         prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
         spins[idx] = rng.choice([-1, 1], p=[1 - prob, prob])
     return spins
