@@ -9,7 +9,7 @@ import pandas as pd
 import h5py
 
 from dimod import BinaryQuadraticModel
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from tqdm import tqdm
 
 rng = np.random.default_rng()
@@ -124,17 +124,30 @@ def gibbs_sampling_ising_vectorized_2d(h: dict, J: dict, beta: float, num_steps:
 
 
 def find_neighbours(h: dict, J: dict):
-    neighbourhood = {}
-    for node in h.keys():
-        for edge in J.keys():
-            if node in edge:
-                ...
+    neighbourhood = {node: [] for node in h.keys()}
+    for (u, v), value in J.items():
+        neighbourhood[u].append(v)
+        neighbourhood[v].append(u)
+    return neighbourhood
+
 
 def gibbs_sampling_efficient(h: dict, J: dict, beta: float, num_steps: int):
 
-    spins =  OrderedDict({i: rng.choice([-1, 1]) for i in h.keys()})
-    for _ in range(num_steps):
-        idx = rng.choice(list(h.keys()))
+    spins = OrderedDict({i: rng.choice([-1, 1]) for i in h.keys()})
+    neighbourhood = find_neighbours(h, J)
+    for _ in tqdm(range(num_steps), desc="gibbs sampling"):
+        idx = rng.choice(list(h.keys()), size=1)
+        idx = idx.item()
+        neighbours = neighbourhood[idx]
+        sum = 0
+        for j in neighbours:
+            J_ij = J[(idx, j)] if (idx, j) in J.keys() else J[(j, idx)]
+            sum += J_ij * spins[j]
+        # Difference s+ and s-
+        deltaE = 2 * sum * h[idx]
+        prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
+        spins[idx] = rng.choice([-1, 1], p=[1 - prob, prob])
+    return spins
 
 
 def vectorize(h: dict, J: dict):
