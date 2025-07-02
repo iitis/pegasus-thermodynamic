@@ -334,7 +334,7 @@ if __name__ == "__main__":
         "-T",
         "--types",
         type=str,
-        default=["SpinGlass"],
+        default=["DWave"],
         choices=["SpinGlass", "DWave", "MatrixMarket"],
         nargs="*",
     )
@@ -348,13 +348,6 @@ if __name__ == "__main__":
         "-D",
         "--device",
         default=None,
-        choices=[
-            "Advantage_system4.1",
-            "Advantage_system5.2",
-            "Advantage_system6.1",
-            "Advantage_system6.2",
-            None,
-        ],
         help="Map instance info physical D-Wave's device. Input None for no Mapping",
     )
 
