@@ -82,6 +82,7 @@ def generate_embedded_kings_ladders(
         sampler_graph: nx.Graph,
         path: str,
         category: str = "random",
+        no_external_fields: bool = False,
         name: Optional[str] = None) -> None:
 
     print("Preprocessing")
@@ -92,10 +93,10 @@ def generate_embedded_kings_ladders(
 
     for i in tqdm(range(number), desc=f"Generating kings ladder instances of size {size}"):
         embedding = find_embedding(ladder, clique_graph)
-
-        assert max([len(chain) for chain in embedding.values()]) == 1
+        while max([len(chain) for chain in embedding.values()]) != 1:
+          embedding = find_embedding(ladder, clique_graph)
         if category == "random":
-            J, h = create_random_instance(ladder)
+            J, h = create_random_instance(ladder, no_external_fields)
         else:
             raise ValueError("Wrong value of \"category\"")
 

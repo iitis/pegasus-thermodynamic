@@ -131,11 +131,21 @@ def find_neighbours(h: dict, J: dict):
     return neighbourhood
 
 
+def stable_sigmoid(x):
+    """Numerically stable sigmoid function."""
+    if x >= 0:
+        z = np.exp(-x)
+        return 1 / (1 + z)
+    else:
+        z = np.exp(x)
+        return z / (1 + z)
+
 def gibbs_sampling_efficient(h: dict, J: dict, beta: float, num_steps: int):
 
     spins = OrderedDict({i: rng.choice([-1, 1]) for i in h.keys()})
     neighbourhood = find_neighbours(h, J)
-    for _ in tqdm(range(num_steps), desc="gibbs sampling"):
+    # for _ in tqdm(range(num_steps), desc="gibbs sampling"):
+    for _ in range(num_steps):
         idx = rng.choice(list(h.keys()), size=1)
         idx = idx.item()
         neighbours = neighbourhood[idx]
@@ -145,7 +155,8 @@ def gibbs_sampling_efficient(h: dict, J: dict, beta: float, num_steps: int):
             sum += J_ij * spins[j]
         # Difference s+ and s-
         deltaE = 2 * (sum + h[idx])
-        prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
+        # prob = 1 / (1 + np.exp(beta * deltaE))  # P(s_i = 1| s_-i)
+        prob = stable_sigmoid(beta * deltaE)
         spins[idx] = rng.choice([-1, 1], p=[1 - prob, prob])
     return spins
 

@@ -191,6 +191,7 @@ def generate_pegasus_instances(
                         graph.remove_edge(reversed_edge[0], reversed_edge[1])
         else:
             perfect_mappings, _ = find_all_mappings(source, sampler)
+            print(f"Found {len(perfect_mappings)} perfect mappings")
             if not perfect_mappings:
                 raise ValueError("No perfect mapping found")
             mapping = rng.choice(perfect_mappings)
@@ -238,6 +239,9 @@ def generate_pegasus_instances(
         elif category == "RCO":
             bias = {node: 0 for node in graph.nodes()}
             couplings = {edge: rng.uniform(-1, 1) for edge in graph.edges()}
+        elif category == "CON":
+            # bias = {node: int(rng.choice([-2, 2])) for node in graph.nodes()}
+            couplings = {edge: -1 for edge in graph.edges()}
         else:
             raise ValueError(
                 f'Category {category} is not a valid choice. It should be "RAU", "RCO" or "AC3"'
@@ -317,9 +321,9 @@ if __name__ == "__main__":
         "-C",
         "--category",
         type=str,
-        default="RAU",
-        choices=["RAU", "RCO", "AC3", "CBFM-P"],
-        help="Category of generated instances. RAU - random uniform, RCO - random couplings only, "
+        default="CON",
+        choices=["CON", "RAU", "RCO", "AC3", "CBFM-P"],
+        help="Category of generated instances. CON - constant coupling, RAU - random uniform, RCO - random couplings only, "
         "AC3 - anti-cluster",
     )
     parser.add_argument(
@@ -364,4 +368,5 @@ if __name__ == "__main__":
         args.category,
         diagonal=args.diag,
         device=args.device,
+        all_mappings=True,
     )
