@@ -68,11 +68,11 @@ def setup_logging(output_dir: str, log_level: str = "INFO") -> logging.Logger:
 def stable_sigmoid(x) -> float:
     """Numerically stable sigmoid function."""
     if x >= 0:
-        z = np.exp(x)
-        return 1 / (1 + z)
-    else:
         z = np.exp(-x)
-        return z / (1 + z)
+        return z / (1.0 + z)
+    else:
+        z = np.exp(x)
+        return 1.0 / (1.0 + z)
 
 
 def get_neighbourhood_from_bqm(bqm: BinaryQuadraticModel) -> dict:
@@ -99,33 +99,30 @@ def next_pow_two(n: int) -> int:
         i = i << 1
     return i
 
-def compute_autocorrelation_fft(x: np.ndarray) -> np.ndarray:
+def compute_autocorrelation_fft(x: np.ndarray):
     """
-    Compute the normalized autocorrelation function using FFT.
+    Compute normalized autocorrelation using FFT.
+
+    Returns
+    -------
+    acf : np.ndarray or None
+        Normalized autocorrelation for non-negative lags,
+        or None if variance is zero (frozen signal).
     """
     n = len(x)
-    # Pad to next power of two for speed and to avoid circular correlation
-    n_fft = next_pow_two(2 * n)
-    
-    # Center the data
-    x_centered = x - np.mean(x)
-    
-    # FFT
-    f_x = np.fft.fft(x_centered, n=n_fft)
-    
-    # Power spectral density
-    psd = f_x * np.conj(f_x)
-    
-    # Inverse FFT
-    acf = np.fft.ifft(psd).real[:n]
-    
-    # Normalize
     var = np.var(x)
-    if var == 0:
-        return np.ones(n)
-        
-    acf = acf / acf[0]
-    return acf
+
+    if var == 0.0:
+        # signal that system is most likely frozen
+        return None  
+
+    n_fft = next_pow_two(2 * n)
+    x = x - np.mean(x)
+
+    f_x = np.fft.fft(x, n=n_fft)
+    acf = np.fft.ifft(f_x * np.conj(f_x)).real[:n]
+
+    return acf / acf[0]
 
 def tau_cap(beta: float) -> Optional[float]:
     """
@@ -138,34 +135,34 @@ def tau_cap(beta: float) -> Optional[float]:
     else:
         return None
 
-def compute_integrated_autocorrelation_time(series: np.ndarray, c: float = 5.0) -> float:
+
+def compute_integrated_autocorrelation_time(
+    x: np.ndarray,
+    max_lag: int | None = None,
+):
     """
-    Estimate the integrated autocorrelation time (tau_int) using the automatic windowing method.
-    Using procedure from Sokal (1996) / emcee.
+    Compute integrated autocorrelation time.
+
+    Returns
+    -------
+    tau : float
+        Estimated τ_int, or np.inf if undefined (frozen chain).
     """
-    n = len(series)
-    if n < 10:
-        return 1.0
-        
-    acf = compute_autocorrelation_fft(series)
-    
-    # Automatic windowing
-    tau = 1.0
-    for M in range(1, n):
-        # Check positive sequence / noise condition (optional but robust)
-        if acf[M] < 0:
-            # Sokal suggests stopping when ACF goes negative for the first time
+    acf = compute_autocorrelation_fft(x)
+
+    if acf is None:
+        return np.inf  # <-- frozen regime
+
+    if max_lag is None:
+        max_lag = len(acf)
+
+    tau = 0.5
+    for k in range(1, max_lag):
+        if acf[k] <= 0:
             break
-            
-        tau = 1.0 + 2.0 * np.sum(acf[1:M+1])
-        
-        if M >= c * tau:
-            return tau
-            
+        tau += acf[k]
+
     return tau
-
-
-
 
 
 def gibbs_sweep(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: dict, 
@@ -334,7 +331,7 @@ def run_burn_in_phase(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: dic
     # STATIONARITY BUFFER
     # Strictly throw away these samples, no diagnostics
     if post_burn_in_sweeps > 0:
-        logger.info(f"Running strict stationarity buffer: {post_burn_in_sweeps} sweeps")
+        logger.info(f"Running buffer: {post_burn_in_sweeps} sweeps")
         # No recording
         pbar_buffer = tqdm(range(post_burn_in_sweeps), desc="Buffer", unit="sweep")
         for i in pbar_buffer:
@@ -441,13 +438,19 @@ def run_sampling_phase(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: di
                 # 5. Energy-based tau estimation
                 e_arr = np.array(energy_window)
                 tau_raw_energy = compute_integrated_autocorrelation_time(e_arr)
+                frozen = not np.isfinite(tau_raw_energy)
                 
                 # 6. Temperature-aware tau cap
                 cap = tau_cap(beta)
-                if cap is not None:
-                    current_tau_eff = min(tau_raw_energy, cap)
+                if frozen:
+                    # Frozen regime: τ is undefined, not just "large"
+                    current_tau_eff = cap if cap is not None else np.inf
                 else:
-                    current_tau_eff = tau_raw_energy
+                    if cap is not None:
+                        current_tau_eff = min(tau_raw_energy, cap)
+                    else:
+                        current_tau_eff = tau_raw_energy
+
                     
                 # 9. Magnetization tau -> diagnostics only
                 m_arr = np.array(mag_window)
@@ -456,10 +459,22 @@ def run_sampling_phase(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: di
                 current_tau_energy = tau_raw_energy
                 
                 # 7. Sampling rule
-                required_interval = int(np.ceil(safety_factor * current_tau_eff))
-                required_interval = max(required_interval, 1) # Safety floor
+                # required_interval = int(np.ceil(safety_factor * current_tau_eff))
+                # required_interval = max(required_interval, 1) # Safety floor
+
+                # 7. Sampling rule
+                if frozen:
+                    # Do NOT gate sampling on τ when chain is frozen
+                    required_interval = 10
+                else:
+                    required_interval = int(np.ceil(safety_factor * current_tau_eff))
+                    required_interval = max(required_interval, 100)  # at least 100 to be safe
                 
-                pbar.set_description(f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}")
+                # pbar.set_description(f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}")
+                if frozen:
+                    pbar.set_description("Sampling | frozen phase (τ undefined)")
+                else:
+                    pbar.set_description(f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}")
 
         elif not use_fixed and not window_filled:
             # Enforce conservative wait
@@ -593,9 +608,9 @@ def main():
                         help="Output directory for results")
     parser.add_argument("--output_prefix", type=str, default="gibbs",
                         help="Prefix for output files")
-    
+   
     # Other parameters
-    parser.add_argument("--seed", type=int, default=None,
+    parser.add_argument("--seed", type=int, default=12345,
                         help="Random seed for reproducibility")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
