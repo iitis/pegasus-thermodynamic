@@ -33,28 +33,30 @@ if __name__ == "__main__":
     qpu_sampler = DWaveSampler(
         solver="Advantage_system6.4",
         # solver="Advantage2_system1.6",
-        token = "julr-bf16fdadab879dbeb1960fe55070031134855957",
     )  # specify device used
     target = qpu_sampler.to_networkx_graph()
 
-    BETA_1_VALUES = [1.0]
+    BETA_1_VALUES = [round(s, 3) for s in  list(np.arange(0.5, 1.1, 0.1))]
     print(f"BETA_1_VALUES: {BETA_1_VALUES}")
     NUM_SAMPLES = 50
-    GIBBS_NUM_STEPS = 10**4
-    anneal_time = [100, 200, 500, 1000]
+    GIBBS_NUM_SWEEPS = 10**3
+    anneal_time = [100] #, 200, 500, 1000]
     NUM_READS = 50
     initial_value = 1.0
     anneal_params = {
-        "CON": np.arange(0.1, 0.9, 0.01),
-        "RAU": np.arange(0.1, 0.9, 0.01),
-        "CBFM": np.arange(0.1, 0.9, 0.01),
+        "CON": [round(s, 3) for s in np.arange(0.1, 0.9, 0.05)],
+        # "RAU": np.arange(0.1, 0.9, 0.01),
+        # "CBFM": np.arange(0.1, 0.9, 0.01),
     }
     
     SCALING = [6]  # crashed for 1000 at 382 samples
 
-    itype = ["CON", "RAU", "CBFM"]
+    itype = ["CON"]
     instance_graph = "pegasus"
 
+    print("Starting processing of instances...")
+    print("beta_1_values:", BETA_1_VALUES)
+    print("anneal_time:", anneal_time)
     for BETA_1 in BETA_1_VALUES:
         for chain_length in SCALING:
             for ITYPE in itype:
@@ -75,7 +77,8 @@ if __name__ == "__main__":
                     instance_basename = os.path.basename(instance_file).replace('.pkl', '')
                     
                     output_path = os.path.join(
-                        ROOT, "data", "raw_data", f"annealing_param_P{chain_length}_{ITYPE}_advantage6.4"
+                        # ROOT, "data", "raw_data", f"fixed_gibbs_annealing_param_P{chain_length}_{ITYPE}_advantage6.4"
+                        ROOT, "data", "raw_data", f"fixed_gibbs_phase_diagram_P{chain_length}_{ITYPE}_advantage6.4"
                     )
                     if not os.path.exists(output_path):
                         os.makedirs(output_path)
@@ -129,12 +132,8 @@ if __name__ == "__main__":
                                 # for i, (k,v) in enumerate(initial_state.items()):
                                 #   print(f"{i}: {k} -> {v}, {tmp[i]}")
                                 # exit(1)
-                                if BETA_1 <= 10:
-                                  GIBBS_NUM_STEPS = 10**4
-                                else:
-                                  GIBBS_NUM_STEPS = 10**5
                                 initial_state = dict(
-                                 gibbs_sampling_efficient(h, J, BETA_1, GIBBS_NUM_STEPS) 
+                                 gibbs_sampling_efficient(h, J, BETA_1, GIBBS_NUM_SWEEPS)
                                 )
                                
                                 init_state = np.array(list(initial_state.values()))

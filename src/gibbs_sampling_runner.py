@@ -1,770 +1,570 @@
 #!/usr/bin/env python3
+"""gibbs_sampling_runner_fast.py
+
+Optimized version of the Gibbs sampling runner.
+
+Main speedups vs. the baseline runner:
+  - spins stored as a NumPy int8 array rather than a Python dict
+  - precomputes linear terms h and an adjacency list with integer indices
+  - tracks energy and magnetization incrementally (O(1) per sweep to read)
+  - avoids opening/closing the diagnostics CSV for every sample
+
+The command-line interface and output format are kept intentionally similar.
 """
-Gibbs Sampling Runner Script
 
-This script performs Gibbs sampling with adaptive burn-in and sampling phases.
-It monitors energy during burn-in and autocorrelation during sampling.
-
-Usage:
-    python gibbs_sampling_runner.py --instance_path <path> --beta <value> [options]
-
-Example:
-    python gibbs_sampling_runner.py \
-        --instance_path ./data/instances/subpegasus_native/P6_CON_1.pkl \
-        --beta 1.0 \
-        --num_burn_in_sweeps 1000 \
-        --num_sampling_sweeps 100 \
-        --num_samples 1000 \
-        --output_dir ./gibbs_results
-"""
+from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import pickle
 import sys
-from collections import OrderedDict
 from datetime import datetime
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from dimod import BinaryQuadraticModel
 
-# Set up random number generator
+try:
+    from dimod import BinaryQuadraticModel
+except Exception as e:  # pragma: no cover
+    raise ImportError(
+        "This script requires 'dimod'. Install it in your environment (e.g. pip install dimod)."
+    ) from e
+
+
+# RNG (seeded in main)
 rng = np.random.default_rng()
 
-# Configure logging
+
 def setup_logging(output_dir: str, log_level: str = "INFO") -> logging.Logger:
-    """Set up logging with both file and console handlers."""
     os.makedirs(output_dir, exist_ok=True)
-    
     logger = logging.getLogger("gibbs_sampling")
     logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Clear existing handlers
     logger.handlers = []
-    
-    # Console handler
+    logger.propagate = False
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    console_format = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', 
-                                        datefmt='%H:%M:%S')
-    console_handler.setFormatter(console_format)
+    console_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+    )
     logger.addHandler(console_handler)
-    
-    # File handler
+
     log_file = os.path.join(output_dir, f"gibbs_sampling_{datetime.now():%Y%m%d_%H%M%S}.log")
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)
-    file_format = logging.Formatter('%(asctime)s | %(levelname)s | %(funcName)s | %(message)s')
-    file_handler.setFormatter(file_format)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(funcName)s | %(message)s")
+    )
     logger.addHandler(file_handler)
-    
     return logger
 
 
-def stable_sigmoid(x) -> float:
-    """Numerically stable sigmoid function."""
-    if x >= 0:
-        z = np.exp(-x)
+def prob_spin_plus_one(beta_deltaE: float) -> float:
+    """Return P(s=+1) = 1/(1+exp(beta*ΔE)) in a numerically stable way."""
+    # For large +x we evaluate exp(-x) to avoid overflow.
+    x = beta_deltaE
+    if x >= 0.0:
+        z = math.exp(-x)  # small
         return z / (1.0 + z)
     else:
-        z = np.exp(x)
+        z = math.exp(x)  # small
         return 1.0 / (1.0 + z)
 
 
-def get_neighbourhood_from_bqm(bqm: BinaryQuadraticModel) -> dict:
-    """Build neighbourhood dictionary from BQM adjacency."""
-    neighbourhood = {node: list(bqm.adj[node].keys()) for node in bqm.variables}
-    return neighbourhood
-
-
-def compute_energy_bqm(spins: dict, bqm: BinaryQuadraticModel) -> float:
-    """Compute total energy of the spin configuration using BQM."""
-    return float(bqm.energy(spins))
-
-
-def compute_magnetization(spins: dict) -> float:
-    """Compute magnetization (mean spin value)."""
-    return float(np.mean(list(spins.values())))
-
-
-
 def next_pow_two(n: int) -> int:
-    """Returns the next power of two greater than or equal to n."""
     i = 1
     while i < n:
-        i = i << 1
+        i <<= 1
     return i
 
-def compute_autocorrelation_fft(x: np.ndarray):
-    """
-    Compute normalized autocorrelation using FFT.
 
-    Returns
-    -------
-    acf : np.ndarray or None
-        Normalized autocorrelation for non-negative lags,
-        or None if variance is zero (frozen signal).
-    """
+def compute_autocorrelation_fft(x: np.ndarray) -> Optional[np.ndarray]:
     n = len(x)
-    var = np.var(x)
-
+    var = float(np.var(x))
     if var == 0.0:
-        # signal that system is most likely frozen
-        return None  
-
+        return None
     n_fft = next_pow_two(2 * n)
-    x = x - np.mean(x)
-
-    f_x = np.fft.fft(x, n=n_fft)
-    acf = np.fft.ifft(f_x * np.conj(f_x)).real[:n]
-
+    x0 = x - float(np.mean(x))
+    f = np.fft.fft(x0, n=n_fft)
+    acf = np.fft.ifft(f * np.conj(f)).real[:n]
     return acf / acf[0]
 
+
+def compute_integrated_autocorrelation_time(x: np.ndarray, max_lag: Optional[int] = None) -> float:
+    """Sokal-style τ_int = 1/2 + Σ_{t>=1} ρ(t), truncated at first non-positive ρ."""
+    acf = compute_autocorrelation_fft(x)
+    if acf is None:
+        return float("inf")
+    if max_lag is None:
+        max_lag = len(acf)
+    tau = 0.5
+    for k in range(1, max_lag):
+        if acf[k] <= 0.0:
+            break
+        tau += float(acf[k])
+    return float(tau)
+
+
 def tau_cap(beta: float) -> Optional[float]:
-    """
-    Temperature-dependent cap on integrated autocorrelation time to prevent freezing.
-    """
     if beta > 1.5:
         return 2000.0
     elif beta > 0.8:
         return 3000.0
+    return None
+
+
+def load_instance(instance_path: str, logger: logging.Logger) -> BinaryQuadraticModel:
+    logger.info(f"Loading instance from: {instance_path}")
+
+    if instance_path.endswith(".pkl"):
+        with open(instance_path, "rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, list) and len(data) == 2:
+            h, J = data[0], data[1]
+        elif isinstance(data, tuple) and len(data) == 2:
+            h, J = data
+        elif isinstance(data, dict):
+            h = data.get("h", {})
+            J = data.get("J", {})
+        else:
+            raise ValueError(f"Unexpected pickle format: {type(data)}")
+    elif instance_path.endswith(".json"):
+        import json
+
+        with open(instance_path, "r") as f:
+            data = json.load(f)
+        h = {int(k): v for k, v in data.get("h", {}).items()}
+        J = {tuple(map(int, k.strip("()").split(","))): v for k, v in data.get("J", {}).items()}
     else:
-        return None
+        raise ValueError(f"Unsupported file format: {instance_path}")
+
+    bqm = BinaryQuadraticModel.from_ising(h, J)
+
+    logger.info("Instance loaded successfully")
+    logger.info(f"  Number of spins: {bqm.num_variables}")
+    logger.info(f"  Number of couplings: {bqm.num_interactions}")
+    return bqm
 
 
-def compute_integrated_autocorrelation_time(
-    x: np.ndarray,
-    max_lag: int | None = None,
-):
+def compile_bqm(bqm: BinaryQuadraticModel):
+    """Compile BQM into array-friendly structures for fast Gibbs updates."""
+    nodes = list(bqm.variables)
+    n = len(nodes)
+    node_to_i = {v: i for i, v in enumerate(nodes)}
+    h = np.array([float(bqm.get_linear(v)) for v in nodes], dtype=np.float64)
+
+    # adjacency list: for each i, a list of (j_index, coupling)
+    adj: List[List[Tuple[int, float]]] = [[] for _ in range(n)]
+    for i, v in enumerate(nodes):
+        for u, bias in bqm.adj[v].items():
+            adj[i].append((node_to_i[u], float(bias)))
+    return nodes, node_to_i, h, adj
+
+
+def gibbs_sweep_fast(
+    spins: np.ndarray,
+    energy: float,
+    m_sum: int,
+    h: np.ndarray,
+    adj: List[List[Tuple[int, float]]],
+    beta: float,
+) -> Tuple[float, int]:
+    """One random-scan sweep: N single-site Gibbs updates.
+
+    Returns updated (energy, m_sum). Spins are updated in-place.
     """
-    Compute integrated autocorrelation time.
+    n = spins.shape[0]
 
-    Returns
-    -------
-    tau : float
-        Estimated τ_int, or np.inf if undefined (frozen chain).
-    """
-    acf = compute_autocorrelation_fft(x)
+    for _ in range(n):
+        i = int(rng.integers(0, n))
 
-    if acf is None:
-        return np.inf  # <-- frozen regime
+        # local field f_i = h_i + Σ_j J_ij s_j
+        field = float(h[i])
+        for j, bias in adj[i]:
+            field += bias * float(spins[j])
 
-    if max_lag is None:
-        max_lag = len(acf)
+        # ΔE = E(+1)-E(-1) = 2 f_i
+        deltaE = 2.0 * field
+        p_plus = prob_spin_plus_one(beta * deltaE)
 
-    tau = 0.5
-    for k in range(1, max_lag):
-        if acf[k] <= 0:
-            break
-        tau += acf[k]
+        new = 1 if rng.random() < p_plus else -1
+        old = int(spins[i])
+        if new != old:
+            spins[i] = new
+            energy += (new - old) * field
+            m_sum += (new - old)
 
-    return tau
-
-
-def gibbs_sweep(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: dict, 
-                beta: float, nodes: list) -> dict:
-    """
-    Perform one Gibbs sampling sweep (N single-spin updates).
-    
-    Parameters:
-    -----------
-    spins : dict
-        Current spin configuration
-    bqm : BinaryQuadraticModel
-        The Ising model as a BQM
-    neighbourhood : dict
-        Precomputed neighbour lists
-    beta : float
-        Inverse temperature
-    nodes : list
-        List of spin indices
-    
-    Returns:
-    --------
-    spins : dict
-        Updated spin configuration
-    """
-    N = len(nodes)
-    
-    for _ in range(N):
-        idx = nodes[rng.integers(0, N)]
-        
-        # Calculate local field contribution from neighbours
-        # Using BQM adjacency for coupling values
-        interaction_sum = 0.0
-        for j, coupling in bqm.adj[idx].items():
-            interaction_sum += coupling * spins[j]
-        
-        # Get the linear bias (field) from BQM
-        h_idx = bqm.get_linear(idx)
-        
-        # Energy difference for spin flip
-        deltaE = 2 * (interaction_sum + h_idx)
-        
-        # Gibbs update probability
-        prob_plus_1 = stable_sigmoid(beta * deltaE)
-        
-        # Sample new spin
-        spins[idx] = rng.choice([-1, 1], p=[1 - prob_plus_1, prob_plus_1])
-    
-    return spins
+    return energy, m_sum
 
 
-def run_burn_in_phase(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: dict,
-                      beta: float, nodes: list, num_burn_in_sweeps: Optional[int],
-                      output_dir: str, logger: logging.Logger,
-                      energy_check_window: int = 100,
-                      convergence_threshold: float = 0.01,
-                      post_burn_in_sweeps: int = 1000) -> Tuple[dict, pd.DataFrame]:
-    """
-    Run burn-in phase with energy and magnetization monitoring.
-    Also enforces a strict stationarity buffer after convergence.
-    """
+def run_burn_in_phase_fast(
+    spins: np.ndarray,
+    energy: float,
+    m_sum: int,
+    h: np.ndarray,
+    adj: List[List[Tuple[int, float]]],
+    beta: float,
+    num_burn_in_sweeps: Optional[int],
+    output_dir: str,
+    logger: logging.Logger,
+    energy_check_window: int = 100,
+    convergence_threshold: float = 0.01,
+    post_burn_in_sweeps: int = 1000,
+) -> Tuple[float, int, pd.DataFrame]:
     logger.info("=" * 60)
     logger.info("BURN-IN PHASE")
     logger.info("=" * 60)
-    
-    energy_history = []
-    magnetization_history = []
-    sweep_indices = []
-    
-    # We will use a deque for online convergence checking to avoid storing everything if runs are long
-    # But we also want to save history, so we'll keep the lists but optimize checking.
-    
+
+    energy_history: List[float] = []
+    mag_history: List[float] = []
+    sweep_indices: List[int] = []
+
     sweeps_done = 0
     converged = False
-    
+
     if num_burn_in_sweeps is not None:
-        # Fixed burn-in
-        target_sweeps = num_burn_in_sweeps
-        logger.info(f"Running fixed burn-in: {target_sweeps} sweeps")
-        
-        pbar = tqdm(range(target_sweeps), desc="Burn-in", unit="sweep")
+        target = int(num_burn_in_sweeps)
+        logger.info(f"Running fixed burn-in: {target} sweeps")
+        pbar = tqdm(range(target), desc="Burn-in", unit="sweep")
         for i in pbar:
-            spins = gibbs_sweep(spins, bqm, neighbourhood, beta, nodes)
-            e = compute_energy_bqm(spins, bqm)
-            m = compute_magnetization(spins)
-            
-            energy_history.append(e)
-            magnetization_history.append(m)
+            energy, m_sum = gibbs_sweep_fast(spins, energy, m_sum, h, adj, beta)
+            m = m_sum / spins.shape[0]
+            energy_history.append(float(energy))
+            mag_history.append(float(m))
             sweep_indices.append(sweeps_done)
             sweeps_done += 1
-            
             if (i + 1) % 100 == 0:
-                pbar.set_description(f"Burn-in | E: {e:.4f} | M: {m:.4f}")
-        
-        converged = True # Assumed for fixed
-        logger.info(f"Fixed burn-in complete.")
-
+                pbar.set_description(f"Burn-in | E: {energy:.4f} | M: {m:.4f}")
+        converged = True
     else:
-        # Adaptive burn-in
-        logger.info(f"Running adaptive burn-in (window={energy_check_window}, thresh={convergence_threshold})")
-        logger.info("Monitoring Energy and Magnetization mean/std stability.")
-        
-        min_sweeps = 2 * energy_check_window
-        max_sweeps = 200000 # Safety cap
-        
+        logger.info(
+            f"Running adaptive burn-in (window={energy_check_window}, thresh={convergence_threshold})"
+        )
+        min_sweeps = 2 * int(energy_check_window)
+        max_sweeps = 200_000
         from collections import deque
+
         recent_E = deque(maxlen=energy_check_window)
         prev_E = deque(maxlen=energy_check_window)
         recent_M = deque(maxlen=energy_check_window)
         prev_M = deque(maxlen=energy_check_window)
-        
+
         pbar = tqdm(total=max_sweeps, desc="Adaptive Burn-in", unit="sweep")
-        
         while not converged and sweeps_done < max_sweeps:
-            spins = gibbs_sweep(spins, bqm, neighbourhood, beta, nodes)
-            e = compute_energy_bqm(spins, bqm)
-            m = compute_magnetization(spins)
-            
-            energy_history.append(e)
-            magnetization_history.append(m)
+            energy, m_sum = gibbs_sweep_fast(spins, energy, m_sum, h, adj, beta)
+            m = m_sum / spins.shape[0]
+
+            energy_history.append(float(energy))
+            mag_history.append(float(m))
             sweep_indices.append(sweeps_done)
-            
-            # Update windows
-            recent_E.append(e)
-            recent_M.append(m)
+
+            recent_E.append(float(energy))
+            recent_M.append(float(m))
             if sweeps_done >= energy_check_window:
-                # Keep prev window lagging by check_window
                 prev_E.append(energy_history[-energy_check_window - 1])
-                prev_M.append(magnetization_history[-energy_check_window - 1])
-            
+                prev_M.append(mag_history[-energy_check_window - 1])
+
             sweeps_done += 1
             pbar.update(1)
-            
             if sweeps_done % 100 == 0:
-                pbar.set_description(f"Adap Burn-in | E: {e:.4f} | M: {m:.4f}")
-                
+                pbar.set_description(f"Adap Burn-in | E: {energy:.4f} | M: {m:.4f}")
+
             if sweeps_done >= min_sweeps and sweeps_done % 100 == 0:
-                # Check convergence
-                curr_E_mean, curr_E_std = np.mean(recent_E), np.std(recent_E)
-                prev_E_mean, prev_E_std = np.mean(prev_E), np.std(prev_E)
-                
-                curr_M_mean, curr_M_std = np.mean(recent_M), np.std(recent_M)
-                prev_M_mean, prev_M_std = np.mean(prev_M), np.std(prev_M)
-                
-                # Relative change
-                def rel_change(curr, prev):
-                    if abs(prev) < 1e-9: return abs(curr - prev)
+                curr_E_mean, curr_E_std = float(np.mean(recent_E)), float(np.std(recent_E))
+                prev_E_mean, prev_E_std = float(np.mean(prev_E)), float(np.std(prev_E))
+                curr_M_mean, curr_M_std = float(np.mean(recent_M)), float(np.std(recent_M))
+                prev_M_mean, prev_M_std = float(np.mean(prev_M)), float(np.std(prev_M))
+
+                def rel_change(curr: float, prev: float) -> float:
+                    if abs(prev) < 1e-9:
+                        return abs(curr - prev)
                     return abs(curr - prev) / abs(prev)
-                
+
                 d_E_mean = rel_change(curr_E_mean, prev_E_mean)
                 d_E_std = rel_change(curr_E_std, prev_E_std)
                 d_M_mean = rel_change(curr_M_mean, prev_M_mean)
                 d_M_std = rel_change(curr_M_std, prev_M_std)
-                
-                if (d_E_mean < convergence_threshold and d_E_std < convergence_threshold and
-                    d_M_mean < convergence_threshold and d_M_std < convergence_threshold):
+
+                if (
+                    d_E_mean < convergence_threshold
+                    and d_E_std < convergence_threshold
+                    and d_M_mean < convergence_threshold
+                    and d_M_std < convergence_threshold
+                ):
                     converged = True
                     logger.info(f"Converged at sweep {sweeps_done}")
                     logger.info(f"dE_mean: {d_E_mean:.2e}, dE_std: {d_E_std:.2e}")
                     logger.info(f"dM_mean: {d_M_mean:.2e}, dM_std: {d_M_std:.2e}")
-        
+
         pbar.close()
         if not converged:
-             logger.warning("Burn-in reached max_sweeps without full convergence.")
+            logger.warning("Burn-in reached max_sweeps without full convergence.")
 
-    # STATIONARITY BUFFER
-    # Strictly throw away these samples, no diagnostics
+    # strict post-burn buffer
     if post_burn_in_sweeps > 0:
         logger.info(f"Running buffer: {post_burn_in_sweeps} sweeps")
-        # No recording
-        pbar_buffer = tqdm(range(post_burn_in_sweeps), desc="Buffer", unit="sweep")
-        for i in pbar_buffer:
-            spins = gibbs_sweep(spins, bqm, neighbourhood, beta, nodes)
-            sweeps_done += 1
+        pbar = tqdm(range(post_burn_in_sweeps), desc="Buffer", unit="sweep")
+        for i in pbar:
+            energy, m_sum = gibbs_sweep_fast(spins, energy, m_sum, h, adj, beta)
             if (i + 1) % 100 == 0:
-                m = compute_magnetization(spins)
-                pbar_buffer.set_description(f"Buffer | M: {m:.4f}")
-            
-    # Save Burn-in History
-    energy_df = pd.DataFrame({'sweep': sweep_indices, 'energy': energy_history})
-    # Also save mag for debugging
-    pd.DataFrame({'sweep': sweep_indices, 'magnetization': magnetization_history}).to_csv(
-        os.path.join(output_dir, 'burn_in_magnetization.csv'), index=False)
-    
-    energy_csv_path = os.path.join(output_dir, 'burn_in_energy.csv')
-    energy_df.to_csv(energy_csv_path, index=False)
-    
-    return spins, energy_df
+                m = m_sum / spins.shape[0]
+                pbar.set_description(f"Buffer | M: {m:.4f}")
+
+    # save burn-in diagnostics
+    df_energy = pd.DataFrame({"sweep": sweep_indices, "energy": energy_history})
+    df_energy.to_csv(os.path.join(output_dir, "burn_in_energy.csv"), index=False)
+    pd.DataFrame({"sweep": sweep_indices, "magnetization": mag_history}).to_csv(
+        os.path.join(output_dir, "burn_in_magnetization.csv"), index=False
+    )
+
+    return energy, m_sum, df_energy
 
 
-
-def run_sampling_phase(spins: dict, bqm: BinaryQuadraticModel, neighbourhood: dict,
-                       beta: float, nodes: list, num_sampling_sweeps: Optional[int],
-                       num_samples: int, output_dir: str, logger: logging.Logger,
-                       safety_factor: int = 4) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    Run sampling phase with strictly enforced robust energy-based adaptive sampling.
-    """
+def run_sampling_phase_fast(
+    spins: np.ndarray,
+    energy: float,
+    m_sum: int,
+    h: np.ndarray,
+    adj: List[List[Tuple[int, float]]],
+    beta: float,
+    num_sampling_sweeps: Optional[int],
+    num_samples: int,
+    output_dir: str,
+    logger: logging.Logger,
+    safety_factor: int = 4,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     logger.info("=" * 60)
-    logger.info("SAMPLING PHASE (ROBUST | ENERGY-CONTROLLED)")
+    logger.info("SAMPLING PHASE (FAST | ENERGY-CONTROLLED)")
     logger.info("=" * 60)
-    
+
+    n = spins.shape[0]
+    samples = np.empty((num_samples, n), dtype=np.int8)
+    sample_energies = np.empty((num_samples,), dtype=np.float64)
+    sample_mags = np.empty((num_samples,), dtype=np.float64)
+
     from collections import deque
-    
-    samples = []
-    node_list = list(nodes)
-    
-    # 3. Rolling stationary windows
-    # Default window size 500 as robust baseline
-    acf_window_size = 500 
+
+    acf_window_size = 500
     energy_window = deque(maxlen=acf_window_size)
     mag_window = deque(maxlen=acf_window_size)
-    
-    # State tracking
+
+    use_fixed = num_sampling_sweeps is not None
+    if use_fixed:
+        required_interval = int(num_sampling_sweeps)
+        logger.info(f"Using fixed sampling interval: {required_interval}")
+    else:
+        required_interval = acf_window_size + 1
+        logger.info("Using adaptive sampling (Energy-based)")
+        logger.info(f"ACF Window Size: {acf_window_size}")
+
+    diag_csv_path = os.path.join(output_dir, "sampling_diagnostics.csv")
+    diag_f = open(diag_csv_path, "w", buffering=1)  # line-buffered
+    diag_f.write(
+        "sample_idx,sweep,energy,magnetization,tau_raw_energy,tau_eff_energy,tau_raw_mag,"
+        "sampling_interval,beta,sweeps_waited\n"
+    )
+
     sweeps_since_last_sample = 0
-    samples_collected = 0
     total_sweeps = 0
-    
-    # Initial estimates
+    collected = 0
+    window_filled = False
+
     current_tau_energy = 10.0
     current_tau_eff = 10.0
     tau_raw_mag = 0.0
-    
-    # Sampling interval logic
-    use_fixed = num_sampling_sweeps is not None
-    if use_fixed:
-        required_interval = num_sampling_sweeps
-        logger.info(f"Using fixed sampling interval: {required_interval}")
-    else:
-        # Initial conservative interval until window is full
-        # We enforce at least one full window before first sample
-        required_interval = acf_window_size + 1
-        logger.info(f"Using adaptive sampling (Energy-based)")
-        logger.info(f"ACF Window Size: {acf_window_size}")
-
-    # Diagnostics file
-    diag_csv_path = os.path.join(output_dir, 'sampling_diagnostics.csv')
-    with open(diag_csv_path, 'w') as f:
-        # 10. Metadata & logging
-        f.write("sample_idx,sweep,energy,magnetization,tau_raw_energy,tau_eff_energy,tau_raw_mag,sampling_interval,beta,sweeps_waited\n")
 
     pbar = tqdm(total=num_samples, desc="Sampling", unit="sample")
-    
-    # Flag to indicate if we have filled the window at least once
-    window_filled = False
+    try:
+        while collected < num_samples:
+            energy, m_sum = gibbs_sweep_fast(spins, energy, m_sum, h, adj, beta)
+            total_sweeps += 1
+            sweeps_since_last_sample += 1
 
-    while samples_collected < num_samples:
-        # 1. Perform Sweep
-        spins = gibbs_sweep(spins, bqm, neighbourhood, beta, nodes)
-        total_sweeps += 1
-        sweeps_since_last_sample += 1
-        
-        # 10. Log/Store (Observables)
-        e = compute_energy_bqm(spins, bqm)
-        m = compute_magnetization(spins)
-        
-        energy_window.append(e)
-        mag_window.append(m)
-        
-        # Check Window Status
-        if not window_filled and len(energy_window) == acf_window_size:
-            window_filled = True
-            logger.info("ACF Window filled. Starting adaptive estimation.")
-            
-        # 4. Adaptive Logic (only if not fixed and window is full)
-        if not use_fixed and window_filled:
-            # We can update tau periodically. 
-            # To be robust and responsive, update every sweep or frequently. 
-            # Updating every sweep is expensive if window is large, but for 500 it's fine.
-            # Let's update every 50 sweeps to balance responsiveness and perf.
-            
-            if total_sweeps % 50 == 0:
-                # 5. Energy-based tau estimation
-                e_arr = np.array(energy_window)
-                tau_raw_energy = compute_integrated_autocorrelation_time(e_arr)
-                frozen = not np.isfinite(tau_raw_energy)
-                
-                # 6. Temperature-aware tau cap
-                cap = tau_cap(beta)
-                if frozen:
-                    # Frozen regime: τ is undefined, not just "large"
-                    current_tau_eff = cap if cap is not None else np.inf
-                else:
-                    if cap is not None:
-                        current_tau_eff = min(tau_raw_energy, cap)
+            m = m_sum / n
+
+            # Only maintain ACF windows if we are in adaptive mode
+            if not use_fixed:
+                energy_window.append(float(energy))
+                mag_window.append(float(m))
+                if not window_filled and len(energy_window) == acf_window_size:
+                    window_filled = True
+                    logger.info("ACF Window filled. Starting adaptive estimation.")
+
+                if window_filled and total_sweeps % 50 == 0:
+                    e_arr = np.fromiter(energy_window, dtype=np.float64)
+                    tau_raw_energy = compute_integrated_autocorrelation_time(e_arr)
+                    frozen = not np.isfinite(tau_raw_energy)
+
+                    cap = tau_cap(beta)
+                    if frozen:
+                        current_tau_eff = cap if cap is not None else float("inf")
                     else:
-                        current_tau_eff = tau_raw_energy
+                        current_tau_eff = min(tau_raw_energy, cap) if cap is not None else tau_raw_energy
 
-                    
-                # 9. Magnetization tau -> diagnostics only
-                m_arr = np.array(mag_window)
-                tau_raw_mag = compute_integrated_autocorrelation_time(m_arr)
-                
-                current_tau_energy = tau_raw_energy
-                
-                # 7. Sampling rule
-                # required_interval = int(np.ceil(safety_factor * current_tau_eff))
-                # required_interval = max(required_interval, 1) # Safety floor
+                    m_arr = np.fromiter(mag_window, dtype=np.float64)
+                    tau_raw_mag = compute_integrated_autocorrelation_time(m_arr)
+                    current_tau_energy = tau_raw_energy
 
-                # 7. Sampling rule
-                if frozen:
-                    # Do NOT gate sampling on τ when chain is frozen
-                    required_interval = 10
-                else:
-                    required_interval = int(np.ceil(safety_factor * current_tau_eff))
-                    required_interval = max(required_interval, 100)  # at least 100 to be safe
-                
-                # pbar.set_description(f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}")
-                if frozen:
-                    pbar.set_description("Sampling | frozen phase (τ undefined)")
-                else:
-                    pbar.set_description(f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}")
+                    if frozen:
+                        required_interval = 10
+                        pbar.set_description("Sampling | frozen phase (τ undefined)")
+                    else:
+                        required_interval = int(math.ceil(safety_factor * current_tau_eff))
+                        required_interval = max(required_interval, 100)
+                        pbar.set_description(
+                            f"Sampling | tau_eff: {current_tau_eff:.1f} | int: {required_interval}"
+                        )
 
-        elif not use_fixed and not window_filled:
-            # Enforce conservative wait
-            pbar.set_description(f"Filling buffers: {len(energy_window)}/{acf_window_size}")
-
-        # 7. Sampling Decision Application
-        # Force wait if window not full (implicit rule 4: no sampling before window full)
-        ready_to_sample = False
-        if use_fixed:
-            if sweeps_since_last_sample >= required_interval:
-                ready_to_sample = True
-        else:
-            if window_filled and sweeps_since_last_sample >= required_interval:
-                ready_to_sample = True
-                
-        if ready_to_sample:
-            # Take Sample
-            sample = np.array([spins[node] for node in node_list])
-            samples.append(sample)
-            
-            # Log Diagnostics
-            with open(diag_csv_path, 'a') as f:
-                f.write(f"{samples_collected},{total_sweeps},{e:.4f},{m:.4f},"
-                        f"{current_tau_energy:.4f},{current_tau_eff:.4f},{tau_raw_mag:.4f},"
-                        f"{required_interval},{beta},{sweeps_since_last_sample}\n")
-            
-            samples_collected += 1
-            sweeps_since_last_sample = 0
-            pbar.update(1)
-            
-    pbar.close()
-    
-    return np.array(samples), pd.DataFrame()
-
-
-
-def load_instance(instance_path: str, logger: logging.Logger) -> BinaryQuadraticModel:
-    """
-    Load an Ising model instance from file and create a BQM.
-    
-    Parameters:
-    -----------
-    instance_path : str
-        Path to instance file (.pkl or .json)
-    logger : logging.Logger
-        Logger instance
-    
-    Returns:
-    --------
-    bqm : BinaryQuadraticModel
-        The loaded Ising model as a BQM
-    """
-    logger.info(f"Loading instance from: {instance_path}")
-    
-    if instance_path.endswith('.pkl'):
-        with open(instance_path, 'rb') as f:
-            data = pickle.load(f)
-            # Handle different pickle formats
-            if isinstance(data, list) and len(data) == 2:
-                # Format: [h, J]
-                h, J = data[0], data[1]
-            elif isinstance(data, tuple) and len(data) == 2:
-                # Format: (h, J)
-                h, J = data
-            elif isinstance(data, dict):
-                # Format: {'h': h, 'J': J}
-                h = data.get('h', {})
-                J = data.get('J', {})
+            # decide to sample
+            if use_fixed:
+                ready = sweeps_since_last_sample >= required_interval
             else:
-                raise ValueError(f"Unexpected pickle format: {type(data)}")
-    elif instance_path.endswith('.json'):
-        import json
-        with open(instance_path, 'r') as f:
-            data = json.load(f)
-        h = {int(k): v for k, v in data.get('h', {}).items()}
-        J = {tuple(map(int, k.strip('()').split(','))): v for k, v in data.get('J', {}).items()}
-    else:
-        raise ValueError(f"Unsupported file format: {instance_path}")
-    
-    # Create BQM from h and J
-    bqm = BinaryQuadraticModel.from_ising(h, J)
-    
-    logger.info(f"Instance loaded successfully")
-    logger.info(f"  Number of spins: {bqm.num_variables}")
-    logger.info(f"  Number of couplings: {bqm.num_interactions}")
-    
-    # Log field and coupling statistics
-    h_values = np.array([bqm.get_linear(v) for v in bqm.variables])
-    J_values = np.array([bias for (u, v, bias) in bqm.iter_quadratic()])
-    if len(h_values) > 0:
-        logger.info(f"  Field range: [{h_values.min():.4f}, {h_values.max():.4f}]")
-    if len(J_values) > 0:
-        logger.info(f"  Coupling range: [{J_values.min():.4f}, {J_values.max():.4f}]")
-    
-    return bqm
+                ready = window_filled and sweeps_since_last_sample >= required_interval
+
+            if ready:
+                samples[collected, :] = spins
+                sample_energies[collected] = energy
+                sample_mags[collected] = m
+
+                diag_f.write(
+                    f"{collected},{total_sweeps},{energy:.4f},{m:.4f},"
+                    f"{current_tau_energy:.4f},{current_tau_eff:.4f},{tau_raw_mag:.4f},"
+                    f"{required_interval},{beta},{sweeps_since_last_sample}\n"
+                )
+
+                collected += 1
+                sweeps_since_last_sample = 0
+                pbar.update(1)
+
+    finally:
+        pbar.close()
+        diag_f.close()
+
+    return samples, sample_energies, sample_mags
 
 
-def main():
-    # ==========================================================================
-    # PARAMETERS
-    # ==========================================================================
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Gibbs Sampling with Adaptive Burn-in and Sampling",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Gibbs Sampling with Adaptive Burn-in and Sampling (FAST)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
-    # Required parameters
-    parser.add_argument("--instance_path", type=str, required=True,
-                        help="Path to the instance file (.pkl or .json)")
-    parser.add_argument("--beta", type=float, required=True,
-                        help="Inverse temperature for sampling")
-    
-    # Burn-in parameters
-    parser.add_argument("--num_burn_in_sweeps", type=int, default=None,
-                        help="Number of burn-in sweeps. None for adaptive burn-in.")
-    parser.add_argument("--burn_in_window", type=int, default=100,
-                        help="Window size for adaptive burn-in convergence check")
-    parser.add_argument("--burn_in_threshold", type=float, default=0.01,
-                        help="Convergence threshold for adaptive burn-in")
-    parser.add_argument("--post_burn_in_sweeps", type=int, default=1000,
-                        help="Number of additional sweeps after burn-in convergence (adaptive mode)")
-    
-    # Sampling parameters
-    parser.add_argument("--num_sampling_sweeps", type=int, default=None,
-                        help="Sweeps between samples. None for adaptive (ACF-based).")
-    parser.add_argument("--num_samples", type=int, default=1000,
-                        help="Number of samples to collect")
-    
-    # Output parameters
-    parser.add_argument("--output_dir", type=str, default="./gibbs_results",
-                        help="Output directory for results")
-    parser.add_argument("--output_prefix", type=str, default="gibbs",
-                        help="Prefix for output files")
-   
-    # Other parameters
-    parser.add_argument("--seed", type=int, default=12345,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--log_level", type=str, default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Logging level")
-    
+    parser.add_argument("--instance_path", type=str, required=True)
+    parser.add_argument("--beta", type=float, required=True)
+
+    parser.add_argument("--num_burn_in_sweeps", type=int, default=None)
+    parser.add_argument("--burn_in_window", type=int, default=100)
+    parser.add_argument("--burn_in_threshold", type=float, default=0.01)
+    parser.add_argument("--post_burn_in_sweeps", type=int, default=1000)
+
+    parser.add_argument("--num_sampling_sweeps", type=int, default=None)
+    parser.add_argument("--num_samples", type=int, default=1000)
+
+    parser.add_argument("--output_dir", type=str, default="./gibbs_results")
+    parser.add_argument("--output_prefix", type=str, default="gibbs")
+
+    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
     args = parser.parse_args()
-    
-    # ==========================================================================
-    # SETUP
-    # ==========================================================================
-    
-    # Create output directory with instance basename and beta subdirectory
+
     instance_basename = os.path.splitext(os.path.basename(args.instance_path))[0]
     beta_subdir = f"BETA_{args.beta:.3f}"
     output_dir = os.path.join(args.output_dir, instance_basename, beta_subdir)
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Set up logging
+
     logger = setup_logging(output_dir, args.log_level)
-    
-    # Set random seed
+
     global rng
-    if args.seed is not None:
-        rng = np.random.default_rng(args.seed)
-        logger.info(f"Random seed set to: {args.seed}")
-    
-    # Log all parameters
+    rng = np.random.default_rng(args.seed)
+    logger.info(f"Random seed set to: {args.seed}")
+
     logger.info("=" * 60)
-    logger.info("GIBBS SAMPLING RUNNER")
+    logger.info("GIBBS SAMPLING RUNNER (FAST)")
     logger.info("=" * 60)
-    logger.info("Parameters:")
     for arg, value in sorted(vars(args).items()):
         logger.info(f"  {arg}: {value}")
-    
-    # ==========================================================================
-    # LOAD INSTANCE
-    # ==========================================================================
-    
+
     bqm = load_instance(args.instance_path, logger)
-    
-    # Precompute structures using BQM
-    neighbourhood = get_neighbourhood_from_bqm(bqm)
-    nodes = list(bqm.variables)
-    N = bqm.num_variables
-    
-    # ==========================================================================
-    # INITIALIZE SPINS
-    # ==========================================================================
-    
+    nodes, node_to_i, h, adj = compile_bqm(bqm)
+    n = len(nodes)
+
     logger.info("Initializing random spin configuration...")
-    spins = OrderedDict({v: rng.choice([-1, 1]) for v in bqm.variables})
-    
-    initial_energy = compute_energy_bqm(spins, bqm)
-    initial_mag = compute_magnetization(spins)
-    logger.info(f"Initial state:")
-    logger.info(f"  Energy: {initial_energy:.4f}")
-    logger.info(f"  Magnetization: {initial_mag:.4f}")
-    
-    # ==========================================================================
-    # BURN-IN PHASE
-    # ==========================================================================
-    
-    spins, burn_in_df = run_burn_in_phase(
+    spins = rng.choice(np.array([-1, 1], dtype=np.int8), size=n)
+    m_sum = int(spins.sum())
+    energy = float(bqm.energy({nodes[i]: int(spins[i]) for i in range(n)}))
+    logger.info(f"Initial energy: {energy:.4f}")
+    logger.info(f"Initial magnetization: {m_sum / n:.4f}")
+
+    energy, m_sum, burn_in_df = run_burn_in_phase_fast(
         spins=spins,
-        bqm=bqm,
-        neighbourhood=neighbourhood,
+        energy=energy,
+        m_sum=m_sum,
+        h=h,
+        adj=adj,
         beta=args.beta,
-        nodes=nodes,
         num_burn_in_sweeps=args.num_burn_in_sweeps,
         output_dir=output_dir,
         logger=logger,
         energy_check_window=args.burn_in_window,
         convergence_threshold=args.burn_in_threshold,
-        post_burn_in_sweeps=args.post_burn_in_sweeps
+        post_burn_in_sweeps=args.post_burn_in_sweeps,
     )
-    
-    # ==========================================================================
-    # SAMPLING PHASE
-    # ==========================================================================
-    
-    samples, _ = run_sampling_phase(
+
+    samples, sample_energies, sample_mags = run_sampling_phase_fast(
         spins=spins,
-        bqm=bqm,
-        neighbourhood=neighbourhood,
+        energy=energy,
+        m_sum=m_sum,
+        h=h,
+        adj=adj,
         beta=args.beta,
-        nodes=nodes,
         num_sampling_sweeps=args.num_sampling_sweeps,
         num_samples=args.num_samples,
         output_dir=output_dir,
-        logger=logger
+        logger=logger,
     )
-    
-    # ==========================================================================
-    # SAVE SAMPLES
-    # ==========================================================================
-    
+
     logger.info("=" * 60)
     logger.info("SAVING RESULTS")
     logger.info("=" * 60)
-    
-    # Save samples to compressed numpy file
-    samples_path = os.path.join(output_dir, f'{args.output_prefix}_samples.npz')
+
+    samples_path = os.path.join(output_dir, f"{args.output_prefix}_samples.npz")
     np.savez_compressed(
         samples_path,
         samples=samples,
         beta=args.beta,
-        node_order=np.array(nodes),
-        h_values=np.array([bqm.get_linear(node) for node in nodes]),
-        instance_path=args.instance_path
+        node_order=np.array(nodes, dtype=object),
+        h_values=h,
+        instance_path=args.instance_path,
+        sample_energies=sample_energies,
+        sample_magnetizations=sample_mags,
     )
     logger.info(f"Samples saved to: {samples_path}")
-    
-    # Save metadata
+
     metadata = {
-        'instance_path': args.instance_path,
-        'beta': args.beta,
-        'num_burn_in_sweeps': args.num_burn_in_sweeps if args.num_burn_in_sweeps else len(burn_in_df),
-        'num_sampling_sweeps': args.num_sampling_sweeps,
-        'num_samples': args.num_samples,
-        'num_spins': N,
-        'seed': args.seed
+        "instance_path": args.instance_path,
+        "beta": args.beta,
+        "num_burn_in_sweeps": args.num_burn_in_sweeps if args.num_burn_in_sweeps else len(burn_in_df),
+        "num_sampling_sweeps": args.num_sampling_sweeps,
+        "num_samples": args.num_samples,
+        "num_spins": n,
+        "seed": args.seed,
     }
-    
-    metadata_path = os.path.join(output_dir, f'{args.output_prefix}_metadata.pkl')
-    with open(metadata_path, 'wb') as f:
+    metadata_path = os.path.join(output_dir, f"{args.output_prefix}_metadata.pkl")
+    with open(metadata_path, "wb") as f:
         pickle.dump(metadata, f)
     logger.info(f"Metadata saved to: {metadata_path}")
-    
-    # ==========================================================================
-    # FINAL SUMMARY
-    # ==========================================================================
-    
+
     logger.info("=" * 60)
     logger.info("SUMMARY")
     logger.info("=" * 60)
-    logger.info(f"Total samples collected: {len(samples)}")
+    logger.info(f"Total samples collected: {samples.shape[0]}")
     logger.info(f"Sample shape: {samples.shape}")
-    
-    # Compute final statistics
-    sample_energies = []
-    for sample in samples:
-        s = {node: sample[i] for i, node in enumerate(nodes)}
-        sample_energies.append(compute_energy_bqm(s, bqm))
-    
-    sample_energies = np.array(sample_energies)
-    sample_mags = np.mean(samples, axis=1)
-    
-    logger.info(f"Sample energy: {np.mean(sample_energies):.4f} ± {np.std(sample_energies):.4f}")
-    logger.info(f"Sample magnetization: {np.mean(sample_mags):.4f} ± {np.std(sample_mags):.4f}")
-    
-    logger.info("=" * 60)
-    logger.info("Gibbs sampling complete!")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info("=" * 60)
+    logger.info(f"Sample energy: {sample_energies.mean():.4f} ± {sample_energies.std():.4f}")
+    logger.info(f"Sample magnetization: {sample_mags.mean():.4f} ± {sample_mags.std():.4f}")
 
 
 if __name__ == "__main__":
